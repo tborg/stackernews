@@ -1,0 +1,276 @@
+package hackernews
+
+import (
+	"errors"
+	"fmt"
+	"github.com/PuerkitoBio/goquery"
+	"github.com/codegangsta/cli"
+	"golang.org/x/net/html"
+	"log"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	ROOT_URL   = "https://news.ycombinator.com/"
+	MAIN_TABLE = "#hnmain tr table tr"
+	SPACER     = "spacer"
+	TITLE_ROW  = "athing"
+	SUBTEXT    = "td.subtext"
+)
+
+var number_re = regexp.MustCompile("[0-9]+")
+
+// parseIntFromSelectionText extracts the first series of digits from the
+// selection's text. If the text doesn't contain an integer, 0 is returned.
+func parseIntFromSelectionText(s *goquery.Selection) int {
+	text := number_re.FindString(s.Text())
+	i, err := strconv.Atoi(text)
+	if err != nil {
+		return 0
+	}
+	return i
+}
+
+// The Article struct represents a ranked article from the front page of HN.
+type Article struct {
+	Rank         int
+	Link         string
+	Title        string
+	Score        int
+	User         string
+	CommentCount int
+	CommentsLink string
+}
+
+// parseTitleRow sets the rank, link and title of the article.
+func (a *Article) parseTitleRow(s *goquery.Selection) {
+	a.Rank = parseIntFromSelectionText(s.Find("span.rank"))
+	title := s.Find(".title a")
+	a.Link, _ = title.Attr("href")
+	a.Title = title.Text()
+}
+
+// parseSubtextRow sets the Article's score, user, comment count and comments link.
+// It returns false if the selection is empty or true if the expected subtext was found.
+func (a *Article) parseSubtextRow(s *goquery.Selection) bool {
+	if s.Length() == 0 {
+		return false
+	}
+	a.Score = parseIntFromSelectionText(s.Find("span.score"))
+	links := s.Find("a")
+	a.User = links.First().Text()
+	comments := links.Last()
+	a.CommentsLink, _ = comments.Attr("href")
+	a.CommentCount = parseIntFromSelectionText(comments)
+	return true
+}
+
+// The Comment struct represents a user's comment on an article on the front page of Hacker News.
+type Comment struct {
+	User    string
+	ID      int
+	Color   string
+	Offset  int
+	Content string
+	Replies []*Reply
+	Rank    int
+}
+
+// The Reply struct represents a parent-child relationship between two comments.
+type Reply struct {
+	ParentID int
+	ChildID  int
+}
+
+// parseIndent resolves the width of the visual offset of a comment on HN.
+// A comment on the article has an offset of 0, and a reply to a comment has
+// an offset greater than the parent's.
+func (c *Comment) parseIndent(s *goquery.Selection) {
+	width, _ := s.Find("img").Attr("width")
+	c.Offset, _ = strconv.Atoi(width)
+}
+
+// parseCommentHead resolves the commenter's username and the comment's ID.
+func (c *Comment) parseCommentHead(s *goquery.Selection) error {
+	links := s.Find("a")
+	if links.Length() != 2 {
+		return errors.New("Wrong number of links in comment head")
+	}
+	c.User = links.First().Text()
+	_id, _ := links.Next().Attr("href")
+	id, err := strconv.Atoi(strings.Split(_id, "=")[1])
+	if err != nil {
+		return err
+	}
+	c.ID = id
+	return nil
+}
+
+// parseCommentBody resolves the color of the comment (downvoted comments are
+// displayed with a lighter color) and the content of the comment.
+func (c *Comment) parseCommentBody(s *goquery.Selection) {
+	color, _ := s.Find("font").Attr("color")
+	c.Color = color
+
+	// For the sake of easy text parsing down the line, we're going to extract
+	// the text from the HTML. But we still want to keep visual paragraph breaks.
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		switch n.Type {
+		case html.TextNode:
+			c.Content += strings.TrimSpace(n.Data)
+		case html.ElementNode:
+			if n.Data == "p" {
+				c.Content += "\n\n"
+			}
+		}
+		// Depth-first recursion
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+
+	for _, node := range s.Nodes {
+		f(node)
+	}
+}
+
+// addReply embeds a new reply struct in this comment's Replies list.
+func (c *Comment) addReply(child *Comment) *Reply {
+	r := &Reply{
+		ParentID: c.ID,
+		ChildID:  child.ID,
+	}
+	c.Replies = append(c.Replies, r)
+	return r
+}
+
+// The CommentPage struct represents the set of comments on an article on the
+// front page of Hacker News.
+type CommentPage struct {
+	Comments []*Comment
+}
+
+// parse populates the Comments array of a CommentPage with the comments on an article .
+func (cp *CommentPage) parse(a *Article) *CommentPage {
+	// The
+	doc, _ := goquery.NewDocument(ROOT_URL + a.CommentsLink)
+	comments := doc.Find("span.comment")
+	var stack []*Comment
+
+	comments.Each(func(_ int, s *goquery.Selection) {
+		c := &Comment{}
+		row := s.Parent().Parent()
+		c.parseIndent(row.Find("td.ind"))
+		c.parseCommentHead(row.Find("span.comhead"))
+		// remove boilerplate from the comment text
+		s.Find(".reply").Remove()
+		c.parseCommentBody(s)
+		// prior comments with greater or equal offsets cannot have additional replies
+		var i int
+		for i = len(stack) - 1; i >= 0; i -= 1 {
+			if stack[i].Offset < c.Offset {
+				break
+			}
+		}
+		stack = append(stack[:i+1], c)
+		// If there's a prior comment in the stack, this must be a reply to it.
+		if len(stack) > 1 {
+			stack[len(stack)-2].addReply(c)
+		}
+		cp.Comments = append(cp.Comments, c)
+	})
+	return cp
+}
+
+// NewCommentPage loads the comments for a hacker news article.
+func NewCommentPage(a *Article) *CommentPage {
+	cp := &CommentPage{}
+	return cp.parse(a)
+}
+
+// The FrontPage represents the articles on front page of hacker news.
+type FrontPage struct {
+	Articles []*Article
+}
+
+// next initializes a new article and appends it to the front page.
+func (f *FrontPage) next() *Article {
+	a := &Article{}
+	return a
+}
+
+// parse gets the latest HN front page and parses the articles listed there
+// into Article instances.
+func (f *FrontPage) parse() *FrontPage {
+	page, err := goquery.NewDocument(ROOT_URL)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a := f.next()
+	page.Find(MAIN_TABLE).Each(func(_ int, s *goquery.Selection) {
+		cls, _ := s.Attr("class")
+		switch cls {
+		// Articles are separated by empty tr elements with the "spacer" class
+		case SPACER:
+			a = f.next()
+			// Each article starts with a title row classed (for better or worse) "athing"
+		case TITLE_ROW:
+			a.parseTitleRow(s)
+			// Title rows are followed by an unclassed tr with a child td classed "subtext"
+			// There are also a few other rows without classnames, which should be ignored.
+		case "":
+			if a.parseSubtextRow(s.Find(SUBTEXT)) {
+				f.Articles = append(f.Articles, a)
+			}
+		}
+	})
+	return f
+}
+
+func Poll(ctx *cli.Context) {
+	// The next snapshot won't be taken until the comments from the previous one
+	// have started processing.
+	snapshots := make(chan *FrontPage, 1)
+
+	fmt.Println("Starting snapshot loop")
+
+	// Run the first poll right away (don't wait for the first tick).
+	f := &FrontPage{}
+	f.parse()
+	snapshots <- f.parse()
+
+	// Take a snapshot of the front page every interval.
+	go func() {
+		for _ = range time.Tick(ctx.Duration("interval")) {
+			fmt.Println("Snapshotting front page")
+			f := &FrontPage{}
+			f.parse()
+			snapshots <- f.parse()
+		}
+	}()
+
+	// Don't hammer other websites with requests :)
+	limiter := time.Tick(ctx.Duration("throttle"))
+
+	fmt.Println("Starting comments loop")
+
+	// Run until the process is killed.
+	for fp := range snapshots {
+		fmt.Println("Updating front page comments")
+		for _, a := range fp.Articles {
+			// Block until the rate limit ticker says we can go.
+			<-limiter
+			fmt.Printf("Parsing comments for %s\n", a.CommentsLink)
+			cp := &CommentPage{}
+			cp.parse(a)
+			// TODO: do something useful with these comments.
+			for _, c := range cp.Comments {
+				fmt.Printf("%+v\n", c)
+			}
+		}
+	}
+}
