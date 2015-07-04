@@ -11,7 +11,6 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "StackerNews"
 	app.Usage = "Tracking and Categorizing Hacker News!"
-
 	app.Commands = []cli.Command{
 		{
 			Name:   "poll-hn",
@@ -27,6 +26,11 @@ func main() {
 					Name:  "throttle",
 					Value: time.Second,
 					Usage: "The comments request frequency cap.",
+				},
+				cli.StringFlag{
+					Name:  "connection, c",
+					Value: "user=stackernews dbname=stackernews sslmode=disable",
+					Usage: "The database connection arguments. See http://godoc.org/github.com/lib/pq",
 				},
 			},
 		},

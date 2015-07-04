@@ -1,11 +1,12 @@
 package hackernews
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/codegangsta/cli"
-	"golang.org/x/net/html"
+	_ "github.com/lib/pq"
 	"log"
 	"regexp"
 	"strconv"
@@ -36,11 +37,13 @@ func parseIntFromSelectionText(s *goquery.Selection) int {
 
 // The Article struct represents a ranked article from the front page of HN.
 type Article struct {
+	ID           int
+	SnapshotID   int
 	Rank         int
 	Link         string
 	Title        string
 	Score        int
-	User         string
+	Username     string
 	CommentCount int
 	CommentsLink string
 }
@@ -61,28 +64,34 @@ func (a *Article) parseSubtextRow(s *goquery.Selection) bool {
 	}
 	a.Score = parseIntFromSelectionText(s.Find("span.score"))
 	links := s.Find("a")
-	a.User = links.First().Text()
+	a.Username = links.First().Text()
 	comments := links.Last()
 	a.CommentsLink, _ = comments.Attr("href")
 	a.CommentCount = parseIntFromSelectionText(comments)
 	return true
 }
 
-// The Comment struct represents a user's comment on an article on the front page of Hacker News.
-type Comment struct {
-	User    string
-	ID      int
-	Color   string
-	Offset  int
-	Content string
-	Replies []*Reply
-	Rank    int
+func (a *Article) store(db *sql.DB) {
+	r := db.QueryRow(`INSERT INTO hackernews.articles(rank, link, title, score, username, comment_count, comments_link, snapshot_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id;`,
+		a.Rank, a.Link, a.Title, a.Score, a.Username, a.CommentCount, a.CommentsLink, a.SnapshotID)
+	err := r.Scan(&a.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("stored article")
 }
 
-// The Reply struct represents a parent-child relationship between two comments.
-type Reply struct {
-	ParentID int
-	ChildID  int
+// The Comment struct represents a user's comment on an article on the front page of Hacker News.
+type Comment struct {
+	ID        int
+	Username  string
+	CommentID int
+	Color     string
+	Content   string
+	ArticleID int
+	offset    int
 }
 
 // parseIndent resolves the width of the visual offset of a comment on HN.
@@ -90,7 +99,7 @@ type Reply struct {
 // an offset greater than the parent's.
 func (c *Comment) parseIndent(s *goquery.Selection) {
 	width, _ := s.Find("img").Attr("width")
-	c.Offset, _ = strconv.Atoi(width)
+	c.offset, _ = strconv.Atoi(width)
 }
 
 // parseCommentHead resolves the commenter's username and the comment's ID.
@@ -99,7 +108,7 @@ func (c *Comment) parseCommentHead(s *goquery.Selection) error {
 	if links.Length() != 2 {
 		return errors.New("Wrong number of links in comment head")
 	}
-	c.User = links.First().Text()
+	c.Username = links.First().Text()
 	_id, _ := links.Next().Attr("href")
 	id, err := strconv.Atoi(strings.Split(_id, "=")[1])
 	if err != nil {
@@ -114,55 +123,60 @@ func (c *Comment) parseCommentHead(s *goquery.Selection) error {
 func (c *Comment) parseCommentBody(s *goquery.Selection) {
 	color, _ := s.Find("font").Attr("color")
 	c.Color = color
+	c.Content, _ = s.Html()
+}
 
-	// For the sake of easy text parsing down the line, we're going to extract
-	// the text from the HTML. But we still want to keep visual paragraph breaks.
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		switch n.Type {
-		case html.TextNode:
-			c.Content += strings.TrimSpace(n.Data)
-		case html.ElementNode:
-			if n.Data == "p" {
-				c.Content += "\n\n"
-			}
-		}
-		// Depth-first recursion
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
+func (c *Comment) store(db *sql.DB) {
+	r := db.QueryRow(`INSERT INTO hackernews.comments (comment_id, username, color, content, article_id)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id;`,
+		c.CommentID, c.Username, c.Color, c.Content, c.ArticleID)
+	if err := r.Scan(&c.ID); err != nil {
+		log.Fatal(err)
 	}
-
-	for _, node := range s.Nodes {
-		f(node)
+	r = db.QueryRow(`INSERT INTO hackernews.threads (ancestor, descendant, depth)
+		VALUES ($1, $1, 0)
+		RETURNING id;`,
+		c.ID)
+	var replyID int
+	if err := r.Scan(&replyID); err != nil {
+		log.Fatal(err)
 	}
+	log.Println("stored comment")
 }
 
 // addReply embeds a new reply struct in this comment's Replies list.
-func (c *Comment) addReply(child *Comment) *Reply {
-	r := &Reply{
-		ParentID: c.ID,
-		ChildID:  child.ID,
+func (c *Comment) addReply(child *Comment, db *sql.DB) int {
+	r := db.QueryRow(`INSERT INTO hackernews.threads (ancestor, descendant, depth)
+		SELECT ancestor, $1::integer, depth + 1 FROM hackernews.threads
+		WHERE descendant = $2::integer
+		RETURNING id, depth;`,
+		child.ID, c.ID)
+	var id int
+	var depth int
+	if err := r.Scan(&id, &depth); err != nil {
+		log.Fatal(err)
 	}
-	c.Replies = append(c.Replies, r)
-	return r
+	log.Printf("created reply %d (%d)\n", depth, child.offset)
+	return id
 }
 
 // The CommentPage struct represents the set of comments on an article on the
 // front page of Hacker News.
 type CommentPage struct {
 	Comments []*Comment
+	thread   []*Comment
+	depth    int
 }
 
 // parse populates the Comments array of a CommentPage with the comments on an article .
-func (cp *CommentPage) parse(a *Article) *CommentPage {
+func (cp *CommentPage) parse(a *Article, db *sql.DB) *CommentPage {
 	// The
 	doc, _ := goquery.NewDocument(ROOT_URL + a.CommentsLink)
 	comments := doc.Find("span.comment")
-	var stack []*Comment
 
 	comments.Each(func(_ int, s *goquery.Selection) {
-		c := &Comment{}
+		c := &Comment{ArticleID: a.ID}
 		row := s.Parent().Parent()
 		c.parseIndent(row.Find("td.ind"))
 		c.parseCommentHead(row.Find("span.comhead"))
@@ -170,42 +184,39 @@ func (cp *CommentPage) parse(a *Article) *CommentPage {
 		s.Find(".reply").Remove()
 		c.parseCommentBody(s)
 		// prior comments with greater or equal offsets cannot have additional replies
+		c.store(db)
 		var i int
-		for i = len(stack) - 1; i >= 0; i -= 1 {
-			if stack[i].Offset < c.Offset {
+		for i = cp.depth - 1; i >= 0; i -= 1 {
+			if cp.thread[i].offset < c.offset {
 				break
 			}
 		}
-		stack = append(stack[:i+1], c)
-		// If there's a prior comment in the stack, this must be a reply to it.
-		if len(stack) > 1 {
-			stack[len(stack)-2].addReply(c)
+		cp.thread = append(cp.thread[:i+1], c)
+		cp.depth = len(cp.thread)
+		// If there's a prior comment in the thread, this must be a reply to it.
+		if cp.depth > 1 {
+			cp.thread[cp.depth-2].addReply(c, db)
 		}
 		cp.Comments = append(cp.Comments, c)
 	})
 	return cp
 }
 
-// NewCommentPage loads the comments for a hacker news article.
-func NewCommentPage(a *Article) *CommentPage {
-	cp := &CommentPage{}
-	return cp.parse(a)
-}
-
 // The FrontPage represents the articles on front page of hacker news.
 type FrontPage struct {
-	Articles []*Article
+	Articles   []*Article
+	SnapshotID int
 }
 
 // next initializes a new article and appends it to the front page.
 func (f *FrontPage) next() *Article {
-	a := &Article{}
+	a := &Article{SnapshotID: f.SnapshotID}
 	return a
 }
 
 // parse gets the latest HN front page and parses the articles listed there
 // into Article instances.
-func (f *FrontPage) parse() *FrontPage {
+func (f *FrontPage) parse(db *sql.DB) *FrontPage {
 	page, err := goquery.NewDocument(ROOT_URL)
 	if err != nil {
 		log.Fatalln(err)
@@ -216,6 +227,7 @@ func (f *FrontPage) parse() *FrontPage {
 		switch cls {
 		// Articles are separated by empty tr elements with the "spacer" class
 		case SPACER:
+			a.store(db)
 			a = f.next()
 			// Each article starts with a title row classed (for better or worse) "athing"
 		case TITLE_ROW:
@@ -231,7 +243,29 @@ func (f *FrontPage) parse() *FrontPage {
 	return f
 }
 
+func (f *FrontPage) store(db *sql.DB) {
+	r := db.QueryRow(`INSERT INTO hackernews.snapshots DEFAULT VALUES RETURNING id;`)
+	if err := r.Scan(&f.SnapshotID); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("stored front page")
+}
+
+func NewFrontPage(db *sql.DB, snapshots chan<- *FrontPage) *FrontPage {
+	f := &FrontPage{}
+	f.store(db)
+	fmt.Println("Snapshotting front page")
+	snapshots <- f.parse(db)
+	return f
+}
+
 func Poll(ctx *cli.Context) {
+	db, err := sql.Open("postgres", ctx.String("connection"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	// The next snapshot won't be taken until the comments from the previous one
 	// have started processing.
 	snapshots := make(chan *FrontPage, 1)
@@ -239,17 +273,12 @@ func Poll(ctx *cli.Context) {
 	fmt.Println("Starting snapshot loop")
 
 	// Run the first poll right away (don't wait for the first tick).
-	f := &FrontPage{}
-	f.parse()
-	snapshots <- f.parse()
+	NewFrontPage(db, snapshots)
 
 	// Take a snapshot of the front page every interval.
 	go func() {
 		for _ = range time.Tick(ctx.Duration("interval")) {
-			fmt.Println("Snapshotting front page")
-			f := &FrontPage{}
-			f.parse()
-			snapshots <- f.parse()
+			NewFrontPage(db, snapshots)
 		}
 	}()
 
@@ -266,11 +295,7 @@ func Poll(ctx *cli.Context) {
 			<-limiter
 			fmt.Printf("Parsing comments for %s\n", a.CommentsLink)
 			cp := &CommentPage{}
-			cp.parse(a)
-			// TODO: do something useful with these comments.
-			for _, c := range cp.Comments {
-				fmt.Printf("%+v\n", c)
-			}
+			cp.parse(a, db)
 		}
 	}
 }
